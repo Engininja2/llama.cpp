@@ -40,7 +40,12 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
     // shared memory buffer to cache values between iterations:
     float * vals = vals_smem ? buf_iw + WARP_SIZE : dst + (int64_t)rowx*ncols;
 
-    float max_val = -INFINITY;
+    const float LOG2    = 0.693147181f; // natural log of 2
+    const float LOG_2_E = 1.44269504f;  // log e base 2
+
+    float msum = 0.0f;
+    float nsum = -INFINITY;
+    float nmax = -INFINITY;
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -56,11 +61,16 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         const float val = x[ix]*scale + (mask ? slope*t2f32(mask[iy]) : 0.0f);
 
         vals[col] = val;
-        max_val = max(max_val, val);
+        float n = rintf(val*LOG_2_E);
+        if (n == -INFINITY) n = -FLT_MAX; // Avoid -infinity+infinity=-nan when calculating m and exponents
+        const float m = expf(val-LOG2*n);
+        nmax = fmaxf(n, nsum);
+        msum = ldexpf(m, n-nmax) + ldexpf(msum, nsum-nmax);
+        nsum = nmax;
     }
 
     // find the max value in the block
-    max_val = warp_reduce_max(max_val);
+    nmax = warp_reduce_max(nmax);
     if (block_size > WARP_SIZE) {
         if (warp_id == 0) {
             buf_iw[lane_id] = -INFINITY;
@@ -68,31 +78,18 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         __syncthreads();
 
         if (lane_id == 0) {
-            buf_iw[warp_id] = max_val;
+            buf_iw[warp_id] = nmax;
         }
         __syncthreads();
 
-        max_val = buf_iw[lane_id];
-        max_val = warp_reduce_max(max_val);
+        nmax = buf_iw[lane_id];
+        nmax = warp_reduce_max(nmax);
     }
 
-    float tmp = 0.0f; // partial sum
+    msum = ldexpf(msum, nsum-nmax);
 
-#pragma unroll
-    for (int col0 = 0; col0 < ncols; col0 += block_size) {
-        const int col = col0 + tid;
-
-        if (ncols_template == 0 && col >= ncols) {
-            break;
-        }
-
-        const float val = expf(vals[col] - max_val);
-        tmp += val;
-        vals[col] = val;
-    }
-
-    // find the sum of exps in the block
-    tmp = warp_reduce_sum(tmp);
+    // get the total sum in the block
+    msum = warp_reduce_sum(msum);
     if (block_size > WARP_SIZE) {
         __syncthreads();
         if (warp_id == 0) {
@@ -101,15 +98,15 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         __syncthreads();
 
         if (lane_id == 0) {
-            buf_iw[warp_id] = tmp;
+            buf_iw[warp_id] = msum;
         }
         __syncthreads();
 
-        tmp = buf_iw[lane_id];
-        tmp = warp_reduce_sum(tmp);
+        msum = buf_iw[lane_id];
+        msum = warp_reduce_sum(msum);
     }
 
-    const float inv_sum = 1.0f / tmp;
+    const float inv_sum = 1.0f / msum;
 
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
@@ -120,7 +117,11 @@ static __global__ void soft_max_f32(const float * x, const T * mask, float * dst
         }
 
         const int64_t idst = (int64_t)rowx*ncols + col;
-        dst[idst] = vals[col] * inv_sum;
+        const float val = vals[col];
+        float n = rintf(val*LOG_2_E);
+        if (n == -INFINITY) n = -FLT_MAX;
+        const float m = expf(val-LOG2*n);
+        dst[idst] = ldexpf(m * inv_sum, n-nmax);
     }
 }
 
